@@ -169,8 +169,18 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "ctrlc",
+ "fork",
  "num_cpus",
  "sysinfo",
+]
+
+[[package]]
+name = "fork"
+version = "0.1.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60e74d3423998a57e9d906e49252fb79eb4a04d5cdfe188fb1b7ff9fc076a8ed"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

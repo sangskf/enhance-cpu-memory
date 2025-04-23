@@ -7,6 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process;
+use fork;
 
 #[derive(Parser)]
 #[command(author, version, about = "一个简易的CPU负载工具", long_about = None)]
@@ -170,7 +171,13 @@ fn start_cpu_load(num_cores: usize, background: bool) {
     
     if background {
         println!("程序将在后台运行，使用 'stop' 命令停止");
-        // 在后台模式下，我们仍然需要保持主线程运行
+        // 在后台模式下，分离进程并退出主进程
+        if let Ok(fork::Fork::Child) = fork::daemon(false, false) {
+            // 子进程继续运行
+        } else {
+            // 父进程退出
+            return;
+        }
     }
     
     let handles: Vec<_> = (0..actual_cores)

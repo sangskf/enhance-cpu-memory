@@ -8,4 +8,5 @@ clap = { version = "4.4", features = ["derive"] }
 sysinfo = "0.29"
 ctrlc = "3.4"
 num_cpus = "1.16"
+fork = "0.1"
 
