@@ -7,10 +7,12 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process;
+use std::str::FromStr;
 use fork;
+use bytesize::ByteSize;
 
 #[derive(Parser)]
-#[command(author, version, about = "一个简易的CPU负载工具", long_about = None)]
+#[command(author, version, about = "一个简易的CPU和内存负载工具", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -19,6 +21,10 @@ struct Cli {
     #[arg(short, long, default_value_t = std::cmp::max(1, num_cpus::get() / 2))]
     cores: usize,
 
+    /// 要占用的内存大小（例如："1G"或"512M"）
+    #[arg(short, long)]
+    memory: Option<String>,
+
     /// 是否在后台运行
     #[arg(short, long)]
     background: bool,
@@ -26,21 +32,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// 查看当前CPU使用率
+    /// 查看当前CPU和内存使用率
     Status,
     
-    /// 启动CPU负载
+    /// 启动CPU和内存负载
     Start {
         /// 要使用的CPU核心数量，默认为系统核心数的一半（至少为1）
         #[arg(short, long, default_value_t = std::cmp::max(1, num_cpus::get() / 2))]
         cores: usize,
+        
+        /// 要占用的内存大小（例如："1G"或"512M"）
+        #[arg(short, long)]
+        memory: Option<String>,
         
         /// 是否在后台运行
         #[arg(short, long)]
         background: bool,
     },
     
-    /// 停止正在运行的CPU负载
+    /// 停止正在运行的负载
     Stop,
 }
 
@@ -96,7 +106,7 @@ fn main() {
         Some(Commands::Status) => {
             show_cpu_status();
         },
-        Some(Commands::Start { cores, background }) => {
+        Some(Commands::Start { cores, memory, background }) => {
             // 检查是否已经有实例在运行
             if let Some(pid) = read_pid() {
                 println!("已有一个实例正在运行 (PID: {})。如需停止，请使用 'stop' 命令", pid);
@@ -108,8 +118,8 @@ fn main() {
                 println!("警告：无法保存PID文件: {}", e);
             }
             
-            // 启动CPU负载
-            start_cpu_load(*cores, *background);
+            // 启动负载
+            start_load(*cores, memory.clone(), *background);
         },
         Some(Commands::Stop) => {
             // 读取PID并发送终止信号
@@ -148,26 +158,42 @@ fn main() {
                 println!("警告：无法保存PID文件: {}", e);
             }
             
-            // 启动CPU负载
-            start_cpu_load(cli.cores, cli.background);
+            // 启动负载
+            start_load(cli.cores, cli.memory, cli.background);
         }
     }
 }
 
-/// 启动CPU负载
-fn start_cpu_load(num_cores: usize, background: bool) {
+/// 启动系统负载
+fn start_load(num_cores: usize, memory_size: Option<String>, background: bool) {
     // 设置中断处理
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     ctrlc::set_handler(move || {
         r.store(false, Ordering::SeqCst);
-        println!("正在停止CPU负载...");
+        println!("正在停止系统负载...");
         let _ = remove_pid_file();
     }).expect("无法设置Ctrl-C处理器");
 
     // 启动CPU负载
     let actual_cores = num_cores.min(num_cpus::get());
     println!("启动CPU负载，使用 {} 个核心", actual_cores);
+    
+    // 解析并分配内存
+    let memory_vec = if let Some(size_str) = memory_size {
+        match ByteSize::from_str(&size_str) {
+            Ok(size) => {
+                println!("分配内存: {}", size);
+                Some(vec![0u8; size.as_u64() as usize])
+            }
+            Err(_) => {
+                println!("警告：无效的内存大小格式，将不会分配内存");
+                None
+            }
+        }
+    } else {
+        None
+    };
     
     if background {
         println!("程序将在后台运行，使用 'stop' 命令停止");
@@ -190,19 +216,30 @@ fn start_cpu_load(num_cores: usize, background: bool) {
         })
         .collect();
     
-    // 定期显示CPU使用率
+    // 定期显示系统状态
     let status_thread = {
         let running = running.clone();
+        let memory_size = memory_vec.as_ref().map(|v| v.len());
         thread::spawn(move || {
             let mut sys = System::new_all();
             while running.load(Ordering::SeqCst) {
-                sys.refresh_cpu();
+                sys.refresh_all();
                 let avg_usage = sys.cpus().iter()
                     .take(actual_cores)
                     .map(|cpu| cpu.cpu_usage())
                     .sum::<f32>() / actual_cores as f32;
                 
                 println!("当前CPU使用率: {:.1}%", avg_usage);
+                if let Some(size) = memory_size {
+                    let total = sys.total_memory();
+                    let used = sys.used_memory();
+                    println!("当前内存使用: {:.1}GB / {:.1}GB (已分配: {:.1}GB)",
+                        used as f64 / 1024.0 / 1024.0,
+                        total as f64 / 1024.0 / 1024.0,
+                        size as f64 / 1024.0 / 1024.0 / 1024.0);
+                } else {
+                    // 未指定内存大小时不显示内存信息
+                }
                 thread::sleep(Duration::from_secs(2));
             }
         })
@@ -214,21 +251,25 @@ fn start_cpu_load(num_cores: usize, background: bool) {
     }
     let _ = status_thread.join();
     
+    // 内存会在这里自动释放
+    drop(memory_vec);
+    
     // 清理PID文件
     let _ = remove_pid_file();
 }
 
-/// 显示当前CPU状态
+/// 显示当前系统状态
 fn show_cpu_status() {
     let mut sys = System::new_all();
-    sys.refresh_cpu();
+    sys.refresh_all();
     
+    println!("系统信息:");
     println!("CPU信息:");
     println!("总核心数: {}", sys.cpus().len());
     
-    // 等待一秒以获取准确的CPU使用率
+    // 等待一秒以获取准确的系统使用率
     thread::sleep(Duration::from_secs(1));
-    sys.refresh_cpu();
+    sys.refresh_all();
     
     for (i, cpu) in sys.cpus().iter().enumerate() {
         println!("核心 #{}: {:.1}%", i, cpu.cpu_usage());
@@ -239,6 +280,17 @@ fn show_cpu_status() {
         .sum::<f32>() / sys.cpus().len() as f32;
     
     println!("平均CPU使用率: {:.1}%", avg_usage);
+    
+    // 显示内存信息
+    let total = sys.total_memory();
+    let used = sys.used_memory();
+    let available = sys.available_memory();
+    
+    println!("\n内存信息:");
+    println!("总内存: {:.1} GB", total as f64 / 1024.0 / 1024.0);
+    println!("已用内存: {:.1} GB", used as f64 / 1024.0 / 1024.0);
+    println!("可用内存: {:.1} GB", available as f64 / 1024.0 / 1024.0);
+    println!("内存使用率: {:.1}%", (used as f64 / total as f64) * 100.0);
 }
 
 /// CPU密集型任务，用于提高CPU使用率
