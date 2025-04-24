@@ -197,20 +197,38 @@ fn start_load(num_cores: usize, memory_size: Option<String>, background: bool) {
     };
     
     if background {
-        println!("程序将在后台运行，使用 'stop' 命令停止");
-        // 在后台模式下，分离进程并退出主进程
         #[cfg(unix)]
         {
-            if let Ok(fork::Fork::Child) = fork::daemon(false, false) {
-                // 子进程继续运行
-            } else {
-                // 父进程退出
-                return;
+            println!("程序将在后台运行，使用 'stop' 命令停止");
+            match fork::daemon(false, false) {
+                Ok(fork::Fork::Child) => {
+                    // 子进程继续执行负载
+                    // 重新保存PID，因为子进程PID不同
+                    if let Err(e) = save_pid() {
+                        // 在后台模式下，打印到控制台可能不可见，可以考虑日志记录
+                        eprintln!("警告：无法在后台进程中保存PID文件: {}", e);
+                    }
+                    // 子进程继续执行下面的负载代码
+                }
+                Ok(fork::Fork::Parent(pid)) => {
+                    // 父进程退出
+                    println!("父进程退出，子进程 (PID: {}) 在后台运行", pid);
+                    std::process::exit(0); // 确保父进程干净退出
+                }
+                Err(_) => {
+                    println!("错误：无法 fork 进程以在后台运行");
+                    let _ = remove_pid_file(); // 清理父进程创建的PID文件
+                    return; // 无法后台运行，直接返回
+                }
             }
         }
-        #[cfg(windows)]
+        #[cfg(not(unix))] // 或者 #[cfg(windows)] 如果只想针对Windows
         {
-            println!("警告：Windows平台不支持后台运行模式，将在前台继续运行");
+            // 在 Windows 上，后台运行通常意味着创建一个没有控制台窗口的新进程
+            // 这超出了简单 fork 的范围。这里我们仅打印警告并继续在前台运行。
+            println!("警告：后台运行模式 (-b) 在 Windows 上行为不同或不受支持，程序将继续在前台运行。");
+            println!("如需在 Windows 后台运行，请考虑使用其他工具或方法（如 PowerShell Start-Process 或配置为 Windows 服务）。");
+            // 不执行 fork，继续在前台运行
         }
     }
     

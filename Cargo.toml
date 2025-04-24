@@ -12,8 +12,8 @@ bytesize = "1.3"
 fork = { version = "0.1", optional = true }
 
 [features]
-default = ["unix-support"]
-unix-support = ["fork"]
+default = ["unix-support"] # This feature is now implicitly conditional on Unix
+unix-support = ["dep:fork"] # Depends on the conditionally included fork crate
 
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-feature=+crt-static"]
