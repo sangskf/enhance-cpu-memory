@@ -9,5 +9,9 @@ sysinfo = "0.29"
 ctrlc = "3.4"
 num_cpus = "1.16"
 bytesize = "1.3"
-fork = "0.1"
+fork = { version = "0.1", optional = true }
+
+[features]
+default = ["unix-support"]
+unix-support = ["fork"]
 
