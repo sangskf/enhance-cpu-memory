@@ -4,16 +4,18 @@ use std::thread;
 use std::time::Duration;
 use sysinfo::{System, SystemExt, CpuExt};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::io::{Read, Write, Seek, SeekFrom};
+use std::path::{PathBuf, Path};
 use std::process;
 use std::str::FromStr;
 #[cfg(unix)]
 use fork;
 use bytesize::ByteSize;
+use rand::RngCore;
+use tempfile::tempfile;
 
 #[derive(Parser)]
-#[command(author, version, about = "一个简易的CPU和内存负载工具", long_about = None)]
+#[command(author, version, about = "一个简易的CPU、内存和硬盘负载工具", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -26,6 +28,14 @@ struct Cli {
     #[arg(short, long)]
     memory: Option<String>,
 
+    /// 要占用的硬盘大小（例如："1G"或"512M"）
+    #[arg(short = 'd', long)]
+    disk: Option<String>,
+
+    /// 硬盘占用文件的存储路径，默认为当前目录
+    #[arg(short = 'p', long, default_value = ".")]
+    path: String,
+
     /// 是否在后台运行
     #[arg(short, long)]
     background: bool,
@@ -33,10 +43,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// 查看当前CPU和内存使用率
+    /// 查看当前CPU、内存和硬盘使用率
     Status,
     
-    /// 启动CPU和内存负载
+    /// 启动系统负载
     Start {
         /// 要使用的CPU核心数量，默认为系统核心数的一半（至少为1）
         #[arg(short, long, default_value_t = std::cmp::max(1, num_cpus::get() / 2))]
@@ -45,6 +55,14 @@ enum Commands {
         /// 要占用的内存大小（例如："1G"或"512M"）
         #[arg(short, long)]
         memory: Option<String>,
+
+        /// 要占用的硬盘大小（例如："1G"或"512M"）
+        #[arg(short = 'd', long)]
+        disk: Option<String>,
+
+        /// 硬盘占用文件的存储路径，默认为当前目录
+        #[arg(short = 'p', long, default_value = ".")]
+        path: String,
         
         /// 是否在后台运行
         #[arg(short, long)]
@@ -107,7 +125,7 @@ fn main() {
         Some(Commands::Status) => {
             show_cpu_status();
         },
-        Some(Commands::Start { cores, memory, background }) => {
+        Some(Commands::Start { cores, memory, disk, path, background }) => {
             // 检查是否已经有实例在运行
             if let Some(pid) = read_pid() {
                 println!("已有一个实例正在运行 (PID: {})。如需停止，请使用 'stop' 命令", pid);
@@ -120,7 +138,7 @@ fn main() {
             }
             
             // 启动负载
-            start_load(*cores, memory.clone(), *background);
+            start_load(*cores, memory.clone(), disk.clone(), path.clone(), *background);
         },
         Some(Commands::Stop) => {
             // 读取PID并发送终止信号
@@ -160,13 +178,50 @@ fn main() {
             }
             
             // 启动负载
-            start_load(cli.cores, cli.memory, cli.background);
+            start_load(cli.cores, cli.memory, cli.disk, cli.path, cli.background);
         }
     }
 }
 
+/// 创建指定大小的文件
+fn create_disk_file(size: ByteSize, path: &str) -> std::io::Result<PathBuf> {
+    let path = Path::new(path);
+    let file_path = if path.is_dir() {
+        path.join("disk_load.tmp")
+    } else {
+        path.to_path_buf()
+    };
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&file_path)?;
+
+    let size_bytes = size.as_u64() as usize;
+    
+    // 根据文件大小选择不同的写入策略
+    if size_bytes <= 1024 * 1024 * 10 { // 10MB以下使用随机数据
+        let mut rng = rand::thread_rng();
+        let mut buffer = vec![0u8; 8192]; // 8KB缓冲区
+        let mut remaining = size_bytes;
+        
+        while remaining > 0 {
+            let chunk_size = remaining.min(buffer.len());
+            rng.fill_bytes(&mut buffer[..chunk_size]);
+            file.write_all(&buffer[..chunk_size])?;
+            remaining -= chunk_size;
+        }
+    } else { // 大文件使用稀疏文件策略
+        file.seek(SeekFrom::Start((size_bytes - 1) as u64))?;
+        file.write_all(&[1])?;
+    }
+
+    file.sync_all()?;
+    Ok(file_path)
+}
+
 /// 启动系统负载
-fn start_load(num_cores: usize, memory_size: Option<String>, background: bool) {
+fn start_load(num_cores: usize, memory_size: Option<String>, disk_size: Option<String>, disk_path: String, background: bool) {
     // 设置中断处理
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -180,6 +235,30 @@ fn start_load(num_cores: usize, memory_size: Option<String>, background: bool) {
     let actual_cores = num_cores.min(num_cpus::get());
     println!("启动CPU负载，使用 {} 个核心", actual_cores);
     
+    // 创建硬盘占用文件
+    let disk_file = if let Some(size_str) = disk_size {
+        match ByteSize::from_str(&size_str) {
+            Ok(size) => {
+                match create_disk_file(size, &disk_path) {
+                    Ok(path) => {
+                        println!("创建硬盘占用文件: {}", path.display());
+                        Some(path)
+                    }
+                    Err(e) => {
+                        println!("警告：创建硬盘占用文件失败: {}", e);
+                        None
+                    }
+                }
+            }
+            Err(_) => {
+                println!("警告：无效的硬盘大小格式，将不会创建文件");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // 解析并分配内存
     let memory_vec = if let Some(size_str) = memory_size {
         match ByteSize::from_str(&size_str) {
@@ -279,6 +358,13 @@ fn start_load(num_cores: usize, memory_size: Option<String>, background: bool) {
     
     // 内存会在这里自动释放
     drop(memory_vec);
+    
+    // 清理硬盘占用文件
+    if let Some(path) = disk_file {
+        if let Err(e) = std::fs::remove_file(&path) {
+            println!("警告：清理硬盘占用文件失败: {}", e);
+        }
+    }
     
     // 清理PID文件
     let _ = remove_pid_file();
